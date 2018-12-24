@@ -119,11 +119,11 @@ module Fluent
       #   sock.remote_port
       #   # ...
       # end
-      def server_create(title, port, proto: nil, bind: '0.0.0.0', shared: true, socket: nil, backlog: nil, tls_options: nil, max_bytes: nil, flags: 0, **socket_options, &callback)
-        proto ||= (@transport_config && @transport_config.protocol == :tls) ? :tls : :tcp
+      def server_create(title, port, proto: nil, bind: '0.0.0.0', shared: true, socket: nil, backlog: nil, tls_options: nil, max_bytes: nil, flags: 0, path: nil, **socket_options, &callback)
+        proto ||= (@transport_config && @transport_config.protocol == :tls) ? :tls : :tcp unless proto == :unix
 
         raise ArgumentError, "BUG: title must be a symbol" unless title && title.is_a?(Symbol)
-        raise ArgumentError, "BUG: port must be an integer" unless port && port.is_a?(Integer)
+        raise ArgumentError, "BUG: port must be an integer" unless proto == :unix || (port && port.is_a?(Integer))
         raise ArgumentError, "BUG: invalid protocol name" unless PROTOCOLS.include?(proto)
 
         raise ArgumentError, "BUG: socket option is available only for udp" if socket && proto != :udp
@@ -177,7 +177,9 @@ module Fluent
           end
           server = EventHandler::UDPServer.new(sock, max_bytes, flags, close_socket, @log, @under_plugin_development, &callback)
         when :unix
-          raise "not implemented yet"
+          server = server_create_for_unix_socket(path, backlog, socket_option_setter) do |conn|
+            conn.data(&callback)
+          end
         else
           raise "BUG: unknown protocol #{proto}"
         end
@@ -197,8 +199,8 @@ module Fluent
         server_create(title, port, proto: :tls, **kwargs, &callback)
       end
 
-      def server_create_unix(title, port, **kwargs, &callback)
-        server_create(title, port, proto: :unix, **kwargs, &callback)
+      def server_create_unix(title, _port, **kwargs, &callback)
+        server_create(title, _port, proto: :unix, **kwargs, &callback)
       end
 
       ServerInfo = Struct.new(:title, :proto, :port, :bind, :shared, :server)
@@ -220,6 +222,20 @@ module Fluent
         server.listen(backlog) if backlog
         server
       end
+
+      def server_create_for_unix_socket(path, backlog, socket_option_setter, &block)
+        close_callback = ->(conn){ @_server_mutex.synchronize{ @_server_connections.delete(conn) } }
+        File.unlink(path) if File.exist?(path)
+        server = Coolio::UNIXServer.new(path, EventHandler::UnixSocket, socket_option_setter, close_callback, @log, @under_plugin_development, block) do |conn|
+          @_server_mutex.synchronize do
+            @_server_connections << conn
+          end
+        end
+        server.listen(backlog) if backlog
+        server
+      end
+
+
 
       def server_create_for_tls_connection(shared, bind, port, conf, backlog, socket_option_setter, &block)
         context = cert_option_create_context(conf.version, conf.insecure, conf.ciphers, conf)
@@ -486,6 +502,19 @@ module Fluent
         end
       end
 
+      class UnixCallbackSocket < CallbackSocket
+        ENABLED_EVENTS = [:data, :write_complete, :close]
+
+        def initialize(sock, **kwargs)
+          super("unix", sock, ENABLED_EVENTS, **kwargs)
+          @peeraddr = (@sock.peeraddr rescue PEERADDR_FAILED)
+        end
+
+        def write(data)
+          @sock.write(data)
+        end
+      end
+
       module EventHandler
         class UDPServer < Coolio::IO
           def initialize(sock, max_bytes, flags, close_socket, log, under_plugin_development, &callback)
@@ -747,6 +776,86 @@ module Fluent
             @data_callback.call(data)
           rescue => e
             @log.error "unexpected error on reading data", host: @callback_connection.remote_host, port: @callback_connection.remote_port, error: e
+            @log.error_backtrace
+            close(true) rescue nil
+            raise if @under_plugin_development
+          end
+
+          def on_read_with_connection(data)
+            @data_callback.call(data, @callback_connection)
+          rescue => e
+            @log.error "unexpected error on reading data", host: @callback_connection.remote_host, port: @callback_connection.remote_port, error: e
+            @log.error_backtrace
+            close(true) rescue nil
+            raise if @under_plugin_development
+          end
+
+          def close
+            @mutex.synchronize do
+              return if @closing
+              @closing = true
+              @close_callback.call(self)
+              super
+            end
+          end
+        end
+
+        class UnixSocket < Coolio::UNIXSocket
+          def initialize(sock, socket_option_setter, close_callback, log, under_plugin_development, connect_callback)
+            raise ArgumentError, "socket must be a UNIXSocket: sock=#{sock}" unless sock.is_a?(UNIXSocket)
+
+            socket_option_setter.call(sock)
+
+            @_handler_socket = sock
+            super(sock)
+
+            @log = log
+            @under_plugin_development = under_plugin_development
+
+            @connect_callback = connect_callback
+            @data_callback = nil
+            @close_callback = close_callback
+
+            @callback_connection = nil
+            @closing = false
+
+            @mutex = Mutex.new # to serialize #write and #close
+          end
+
+          def to_io
+            @_handler_socket
+          end
+
+          def data(&callback)
+            raise "data callback can be registered just once, but registered twice" if self.singleton_methods.include?(:on_read)
+            @data_callback = callback
+            on_read_impl = case callback.arity
+                             when 1 then :on_read_without_connection
+                             when 2 then :on_read_with_connection
+                             else
+                               raise "BUG: callback block must have 1 or 2 arguments"
+                           end
+            self.define_singleton_method(:on_read, method(on_read_impl))
+          end
+
+          def write(data)
+            @mutex.synchronize do
+              super
+            end
+          end
+
+          def on_connect
+            @callback_connection = UnixCallbackSocket.new(self)
+            @connect_callback.call(@callback_connection)
+            unless @data_callback
+              raise "connection callback must call #data to set data callback"
+            end
+          end
+
+          def on_read_without_connection(data)
+            @data_callback.call(data)
+          rescue => e
+            @log.error "unexpected error on reading data", error: e
             @log.error_backtrace
             close(true) rescue nil
             raise if @under_plugin_development
